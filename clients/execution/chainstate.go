@@ -16,6 +16,8 @@ import (
 var DefaultSystemContractAddresses = map[string]common.Address{
 	rpc.ConsolidationRequestContract: common.HexToAddress("0x0000BBdDc7CE488642fb579F8B00f3a590007251"),
 	rpc.WithdrawalRequestContract:    common.HexToAddress("0x00000961Ef480Eb55e80D19ad83579A64c007002"),
+	rpc.BeaconRootsContract:          common.HexToAddress("0x000F3df6D732807Ef1319fB7B8bB8522d0Beac02"),
+	rpc.HistoryStorageContract:       common.HexToAddress("0x0000F90827F1C53a10cb7A02335B175320002935"),
 }
 
 type ChainState struct {
@@ -223,6 +225,7 @@ func (cache *ChainState) getBlobScheduleForTimestampFromConfig(timestamp time.Ti
 type BlobScheduleEntry struct {
 	Timestamp time.Time
 	Schedule  rpc.EthConfigBlobSchedule
+	IsBpo     bool
 }
 
 func (cache *ChainState) GetFullBlobSchedule() []BlobScheduleEntry {
@@ -273,6 +276,7 @@ func (cache *ChainState) GetFullBlobSchedule() []BlobScheduleEntry {
 				Target:                uint64(cache.config.Config.BlobScheduleConfig.BPO1.Target),
 				BaseFeeUpdateFraction: uint64(cache.config.Config.BlobScheduleConfig.BPO1.UpdateFraction),
 			},
+			IsBpo: true,
 		})
 	}
 
@@ -284,6 +288,7 @@ func (cache *ChainState) GetFullBlobSchedule() []BlobScheduleEntry {
 				Target:                uint64(cache.config.Config.BlobScheduleConfig.BPO2.Target),
 				BaseFeeUpdateFraction: uint64(cache.config.Config.BlobScheduleConfig.BPO2.UpdateFraction),
 			},
+			IsBpo: true,
 		})
 	}
 
@@ -295,6 +300,7 @@ func (cache *ChainState) GetFullBlobSchedule() []BlobScheduleEntry {
 				Target:                uint64(cache.config.Config.BlobScheduleConfig.BPO3.Target),
 				BaseFeeUpdateFraction: uint64(cache.config.Config.BlobScheduleConfig.BPO3.UpdateFraction),
 			},
+			IsBpo: true,
 		})
 	}
 
@@ -306,6 +312,7 @@ func (cache *ChainState) GetFullBlobSchedule() []BlobScheduleEntry {
 				Target:                uint64(cache.config.Config.BlobScheduleConfig.BPO4.Target),
 				BaseFeeUpdateFraction: uint64(cache.config.Config.BlobScheduleConfig.BPO4.UpdateFraction),
 			},
+			IsBpo: true,
 		})
 	}
 
@@ -317,6 +324,7 @@ func (cache *ChainState) GetFullBlobSchedule() []BlobScheduleEntry {
 				Target:                uint64(cache.config.Config.BlobScheduleConfig.BPO5.Target),
 				BaseFeeUpdateFraction: uint64(cache.config.Config.BlobScheduleConfig.BPO5.UpdateFraction),
 			},
+			IsBpo: true,
 		})
 	}
 

@@ -2,16 +2,18 @@ package services
 
 import (
 	"bytes"
+	"context"
+	"fmt"
 	"math"
 	"slices"
 	"strings"
 	"sync"
 
-	"github.com/attestantio/go-eth2-client/spec/electra"
-	"github.com/attestantio/go-eth2-client/spec/phase0"
 	"github.com/ethpandaops/dora/db"
 	"github.com/ethpandaops/dora/dbtypes"
 	"github.com/ethpandaops/dora/indexer/beacon"
+	"github.com/ethpandaops/go-eth2-client/spec/electra"
+	"github.com/ethpandaops/go-eth2-client/spec/phase0"
 	"github.com/prysmaticlabs/prysm/v5/container/slice"
 	"github.com/sirupsen/logrus"
 )
@@ -76,7 +78,7 @@ func (ccr *CombinedDepositRequest) Amount() uint64 {
 	return 0
 }
 
-func (bs *ChainService) GetDepositRequestsByFilter(filter *CombinedDepositRequestFilter, pageOffset uint64, pageSize uint32) ([]*CombinedDepositRequest, uint64) {
+func (bs *ChainService) GetDepositRequestsByFilter(ctx context.Context, filter *CombinedDepositRequestFilter, pageOffset uint64, pageSize uint32) ([]*CombinedDepositRequest, uint64) {
 	combinedResults := make([]*CombinedDepositRequest, 0)
 	canonicalForkIds := bs.GetCanonicalForkIds()
 
@@ -84,7 +86,7 @@ func (bs *ChainService) GetDepositRequestsByFilter(filter *CombinedDepositReques
 
 	canonicalHead := bs.beaconIndexer.GetCanonicalHead(nil)
 	if canonicalHead != nil {
-		indexedQueue := bs.GetIndexedDepositQueue(canonicalHead)
+		indexedQueue := bs.GetIndexedDepositQueue(ctx, canonicalHead)
 		if indexedQueue != nil {
 			for _, queueEntry := range indexedQueue.Queue {
 				depositIndex := queueEntry.DepositIndex
@@ -120,12 +122,13 @@ func (bs *ChainService) GetDepositRequestsByFilter(filter *CombinedDepositReques
 	}
 
 	txFilter := &dbtypes.DepositTxFilter{
-		Address:       filter.Filter.Address,
-		TargetAddress: filter.Filter.TargetAddress,
-		WithValid:     filter.Filter.WithValid,
+		Address:             filter.Filter.Address,
+		TargetAddress:       filter.Filter.TargetAddress,
+		WithValid:           filter.Filter.WithValid,
+		WithdrawalCredTypes: filter.Filter.WithdrawalCredTypes,
 	}
 
-	dbOperations, totalReqResults := bs.GetDepositOperationsByFilter(operationFilter, txFilter, pageOffset, pageSize)
+	dbOperations, totalReqResults := bs.GetDepositOperationsByFilter(ctx, operationFilter, txFilter, pageOffset, pageSize)
 
 	for _, dbOperation := range dbOperations {
 		if len(combinedResults) >= int(pageSize) {
@@ -168,7 +171,7 @@ func (bs *ChainService) GetDepositRequestsByFilter(filter *CombinedDepositReques
 	return combinedResults, totalReqResults
 }
 
-func (bs *ChainService) GetDepositOperationsByFilter(filter *dbtypes.DepositFilter, txFilter *dbtypes.DepositTxFilter, pageOffset uint64, pageSize uint32) ([]*dbtypes.DepositWithTx, uint64) {
+func (bs *ChainService) GetDepositOperationsByFilter(ctx context.Context, filter *dbtypes.DepositFilter, txFilter *dbtypes.DepositTxFilter, pageOffset uint64, pageSize uint32) ([]*dbtypes.DepositWithTx, uint64) {
 	chainState := bs.consensusPool.GetChainState()
 	_, prunedEpoch := bs.beaconIndexer.GetBlockCacheState()
 	idxMinSlot := chainState.EpochToSlot(prunedEpoch)
@@ -273,7 +276,7 @@ func (bs *ChainService) GetDepositOperationsByFilter(filter *dbtypes.DepositFilt
 			}
 		}
 
-		for _, txDetail := range db.GetDepositTxsByIndexes(detailsForIndex) {
+		for _, txDetail := range db.GetDepositTxsByIndexes(ctx, detailsForIndex) {
 			for _, depositWithTx := range cachedMatches {
 				if depositWithTx.Index != nil && *depositWithTx.Index == txDetail.Index && bytes.Equal(depositWithTx.PublicKey[:], txDetail.PublicKey[:]) {
 					depositWithTx.BlockNumber = &txDetail.BlockNumber
@@ -305,11 +308,19 @@ func (bs *ChainService) GetDepositOperationsByFilter(filter *dbtypes.DepositFilt
 
 			if len(txFilter.WithdrawalAddress) > 0 {
 				wdcreds := depositWithTx.WithdrawalCredentials
-				if wdcreds[0] != 0x01 && wdcreds[0] != 0x02 {
+				// 0x01 = ETH1, 0x02 = compounding, 0x03 = builder deposit
+				if wdcreds[0] != 0x01 && wdcreds[0] != 0x02 && wdcreds[0] != 0x03 {
 					continue
 				}
 
 				if !bytes.Equal(wdcreds[12:], txFilter.WithdrawalAddress) {
+					continue
+				}
+			}
+
+			if len(txFilter.WithdrawalCredTypes) > 0 {
+				wdcreds := depositWithTx.WithdrawalCredentials
+				if len(wdcreds) == 0 || !slices.Contains(txFilter.WithdrawalCredTypes, wdcreds[0]) {
 					continue
 				}
 			}
@@ -344,7 +355,7 @@ func (bs *ChainService) GetDepositOperationsByFilter(filter *dbtypes.DepositFilt
 
 	if cachedEnd <= cachedMatchesLen {
 		// all results from cache, just get result count from db
-		_, dbCount, err = db.GetDepositsFiltered(0, 1, canonicalForkIds, filter, txFilter)
+		_, dbCount, err = db.GetDepositsFiltered(ctx, 0, 1, canonicalForkIds, filter, txFilter)
 	} else {
 		dbSliceStart := uint64(0)
 		if cachedStart > cachedMatchesLen {
@@ -352,7 +363,7 @@ func (bs *ChainService) GetDepositOperationsByFilter(filter *dbtypes.DepositFilt
 		}
 
 		dbSliceLimit := pageSize - uint32(resIdx)
-		dbObjects, dbCount, err = db.GetDepositsFiltered(dbSliceStart, dbSliceLimit, canonicalForkIds, filter, txFilter)
+		dbObjects, dbCount, err = db.GetDepositsFiltered(ctx, dbSliceStart, dbSliceLimit, canonicalForkIds, filter, txFilter)
 	}
 
 	if err != nil {
@@ -382,6 +393,11 @@ type IndexedDepositQueueEntry struct {
 	DepositIndex   *uint64
 	EpochEstimate  phase0.Epoch
 	PendingDeposit *electra.PendingDeposit
+	// Postponed marks a deposit that process_pending_deposits reorders to the back of
+	// the queue (its validator is exiting), so it no longer follows the queue's
+	// slot<->index order and is resolved by slot rather than by position. Its
+	// EpochEstimate is left unset as it does not flow through the normal churn queue.
+	Postponed bool
 }
 
 type IndexedDepositQueue struct {
@@ -391,13 +407,39 @@ type IndexedDepositQueue struct {
 	QueueEstimation phase0.Epoch
 }
 
-func (bs *ChainService) GetIndexedDepositQueue(headBlock *beacon.Block) *IndexedDepositQueue {
+func (bs *ChainService) GetIndexedDepositQueue(ctx context.Context, headBlock *beacon.Block) *IndexedDepositQueue {
+	if headBlock == nil {
+		return nil
+	}
+
 	forkId := headBlock.GetForkId()
 	queueBlockRoot, queueSlot, queueBalance, queue := bs.beaconIndexer.GetLatestDepositQueueByBlockRoot(headBlock.Root)
-	lastIncludedDeposit := bs.getLastIncludedDeposit(queueBlockRoot)
-	if lastIncludedDeposit == nil || lastIncludedDeposit.Index == nil {
-		return &IndexedDepositQueue{
-			Queue: []*IndexedDepositQueueEntry{},
+
+	indexedQueue := &IndexedDepositQueue{
+		Queue: make([]*IndexedDepositQueueEntry, len(queue)),
+	}
+	for idx := range queue {
+		indexedQueue.Queue[idx] = &IndexedDepositQueueEntry{
+			PendingDeposit: queue[idx],
+		}
+	}
+	if len(queue) == 0 {
+		return indexedQueue
+	}
+
+	// Assign EL deposit indexes by position, flagging postponed (reordered) entries
+	// that must instead be resolved by slot.
+	lastIncludedDeposit, includedPubkeyByIndex := bs.getRecentIncludedDeposits(ctx, queueBlockRoot)
+	indexes, postponed := resolveQueueDepositIndexes(queue, lastIncludedDeposit, includedPubkeyByIndex)
+	for idx := range indexedQueue.Queue {
+		indexedQueue.Queue[idx].DepositIndex = indexes[idx]
+	}
+
+	// Resolve postponed entries by slot (one batched query) and flag them for rendering.
+	bs.resolvePostponedDepositIndexes(ctx, queue, indexedQueue.Queue, postponed)
+	for idx := range indexedQueue.Queue {
+		if postponed[idx] {
+			indexedQueue.Queue[idx].Postponed = true
 		}
 	}
 
@@ -407,42 +449,10 @@ func (bs *ChainService) GetIndexedDepositQueue(headBlock *beacon.Block) *Indexed
 		totalActiveBalance = epochStatsValues.ActiveBalance
 	}
 
-	indexedQueue := &IndexedDepositQueue{
-		Queue: make([]*IndexedDepositQueueEntry, len(queue)),
-	}
-
 	queueLen := len(queue)
-	depositIndex := *lastIncludedDeposit.Index
 	newValidators := make(map[phase0.BLSPubKey]interface{})
-	reachedGenesis := false
 
 	var newValidatorsMutex sync.Mutex
-
-	for idx := queueLen - 1; idx >= 0; idx-- {
-		deposit := queue[idx]
-		queueEntry := &IndexedDepositQueueEntry{
-			PendingDeposit: deposit,
-		}
-
-		if deposit.Slot > 0 {
-			depositIndexCopy := uint64(depositIndex)
-			queueEntry.DepositIndex = &depositIndexCopy
-			if depositIndex > 0 {
-				depositIndex--
-			} else {
-				if reachedGenesis {
-					// something is bad, return empty queue
-					return &IndexedDepositQueue{
-						Queue: []*IndexedDepositQueueEntry{},
-					}
-				}
-
-				reachedGenesis = true
-			}
-		}
-
-		indexedQueue.Queue[idx] = queueEntry
-	}
 
 	type workItem struct {
 		idx   int
@@ -457,8 +467,12 @@ func (bs *ChainService) GetIndexedDepositQueue(headBlock *beacon.Block) *Indexed
 		go func() {
 			defer wg.Done()
 			for work := range workChan {
-				_, found := bs.beaconIndexer.GetValidatorIndexByPubkey(work.entry.PendingDeposit.Pubkey)
-				if !found {
+				// A pubkey counts as a new validator unless it already maps to a real
+				// on-chain validator. A projected validator (derived from this very
+				// queue) resolves via GetValidatorIndexByPubkey too, so it must still
+				// be counted as new — otherwise TotalNew undercounts.
+				idx, found := bs.beaconIndexer.GetValidatorIndexByPubkey(work.entry.PendingDeposit.Pubkey)
+				if !found || bs.IsProjectedValidatorIndex(idx) {
 					newValidatorsMutex.Lock()
 					_, isNew := newValidators[work.entry.PendingDeposit.Pubkey]
 					if !isNew {
@@ -492,17 +506,30 @@ func (bs *ChainService) GetIndexedDepositQueue(headBlock *beacon.Block) *Indexed
 	queueEpoch++
 	queueBalance += activationExitChurnLimit
 	currentEpochCount := uint64(0)
-
-	var lastNormalDeposit *IndexedDepositQueueEntry
+	hasChurnDeposit := false
 
 	for idx, queueEntry := range indexedQueue.Queue {
 		queueEntry.QueuePos = uint64(idx)
 
-		if queueEntry.DepositIndex != nil {
-			lastNormalDeposit = queueEntry
-		}
-
-		if totalActiveBalance > 0 {
+		if queueEntry.Postponed {
+			// A postponed deposit is processed at the later of when the churn queue reaches
+			// its position (queueEpoch — postponed deposits sit at the back) and when its
+			// validator becomes withdrawable. If the queue would only reach it after the
+			// validator is already withdrawable, it is processed like a normal queued deposit
+			// and is no longer flagged postponed; otherwise the exit is the bottleneck and it
+			// keeps waiting. Postponed deposits are applied without consuming churn.
+			exitEpoch := bs.postponedDepositEpoch(queueEntry.PendingDeposit.Pubkey)
+			switch {
+			case exitEpoch == 0:
+				// validator/exit unknown: keep flagged, no estimate
+			case exitEpoch > queueEpoch:
+				queueEntry.EpochEstimate = exitEpoch
+			default:
+				queueEntry.EpochEstimate = queueEpoch
+				queueEntry.Postponed = false
+				hasChurnDeposit = true
+			}
+		} else if totalActiveBalance > 0 {
 			if currentEpochCount >= maxPendingDepositsPerEpoch {
 				queueEpoch++
 				queueBalance = activationExitChurnLimit
@@ -518,28 +545,221 @@ func (bs *ChainService) GetIndexedDepositQueue(headBlock *beacon.Block) *Indexed
 			queueEntry.EpochEstimate = queueEpoch
 			currentEpochCount++
 			queueBalance -= queueEntry.PendingDeposit.Amount
+			hasChurnDeposit = true
 		}
 
 		indexedQueue.TotalGwei += queueEntry.PendingDeposit.Amount
 	}
 
-	indexedQueue.QueueEstimation = queueEpoch
-
-	if lastNormalDeposit != nil && !bytes.Equal(lastNormalDeposit.PendingDeposit.Pubkey[:], lastIncludedDeposit.PublicKey[:]) {
-		// something is bad, return empty queue
-		logrus.Warnf("ChainService.GetIndexedDepositQueue: last included deposit not found in queue, %x != %x", lastNormalDeposit.PendingDeposit.Pubkey[:], lastIncludedDeposit.PublicKey[:])
-		return &IndexedDepositQueue{
-			Queue: []*IndexedDepositQueueEntry{},
-		}
+	// Only deposits flowing through the churn queue contribute to the overall processing
+	// estimate; an empty or all-postponed queue leaves QueueEstimation at 0 (rendered as
+	// "--").
+	if hasChurnDeposit {
+		indexedQueue.QueueEstimation = queueEpoch
 	}
 
 	return indexedQueue
 }
 
-func (bs *ChainService) getLastIncludedDeposit(headRoot phase0.Root) *dbtypes.Deposit {
+// postponedDepositEpoch estimates when a postponed deposit will be applied: the epoch its
+// validator becomes withdrawable. Returns 0 (unknown) if the validator can't be resolved or
+// has no concrete withdrawable epoch yet.
+func (bs *ChainService) postponedDepositEpoch(pubkey phase0.BLSPubKey) phase0.Epoch {
+	validatorIdx, found := bs.beaconIndexer.GetValidatorIndexByPubkey(pubkey)
+	if !found || uint64(validatorIdx)&BuilderIndexFlag != 0 {
+		return 0
+	}
+	validator := bs.GetValidatorByIndex(validatorIdx, false)
+	if validator == nil || validator.Validator == nil {
+		return 0
+	}
+	if validator.Validator.WithdrawableEpoch >= beacon.FarFutureEpoch {
+		return 0
+	}
+	return validator.Validator.WithdrawableEpoch
+}
+
+// resolveQueueDepositIndexes assigns an EL deposit index to each queue entry by position
+// and flags the postponed (reordered) entries. It returns, per entry, the resolved index
+// (nil where it must be resolved by slot) and whether the entry is postponed.
+//
+// pending_deposits comes verbatim from the beacon state but carries no EL deposit index.
+// Regular deposits sit in the queue in strict slot<->index order, so their indexes are
+// derived by anchoring the tail to the last included deposit and counting backwards.
+//
+// process_pending_deposits moves deposits of an exiting validator to the back of the
+// queue, breaking that order. Such postponed entries surface as a slot that dips below
+// the running maximum; they are excluded from the backward count (left nil) and resolved
+// individually by slot afterwards. Detection is purely slot-based (independent of the
+// possibly-delayed validator set) so the assigned index is always correct.
+//
+// Matching in the backward count is by deposit index AND pubkey: post-Gloas builder
+// (0x03) deposits get an EL deposit index but never enter the queue, leaving gaps; and
+// 0x01->0x02 compounding-switch deposits are synthesized with no EL deposit at all.
+// Synthetic ones are skipped entirely, and for real ones index gaps are skipped until the
+// pubkey at the candidate index matches the queue entry.
+func resolveQueueDepositIndexes(queue []*electra.PendingDeposit, anchor *dbtypes.Deposit, includedPubkeyByIndex map[uint64]phase0.BLSPubKey) (indexes []*uint64, postponed []bool) {
+	indexes = make([]*uint64, len(queue))
+	postponed = make([]bool, len(queue))
+
+	// Forward pass: flag entries whose slot dips below the running maximum.
+	prevRegularSlot := phase0.Slot(0)
+	for idx, deposit := range queue {
+		if isSyntheticPendingDeposit(deposit) {
+			continue
+		}
+		if deposit.Slot < prevRegularSlot {
+			postponed[idx] = true
+			continue
+		}
+		prevRegularSlot = deposit.Slot
+	}
+
+	// Backward pass: assign indexes to the regular (in-order) entries.
+	tailRegularIdx := -1
+	if anchor != nil && anchor.Index != nil {
+		candidate := int64(*anchor.Index)
+		for idx := len(queue) - 1; idx >= 0; idx-- {
+			deposit := queue[idx]
+			if isSyntheticPendingDeposit(deposit) || postponed[idx] {
+				continue
+			}
+			if candidate < 0 {
+				break // ran out of indexes; leave earlier entries unindexed
+			}
+			// Skip indexes that belong to deposits not present in the queue (builder
+			// gaps). A known pubkey that does not match means this index is a gap.
+			for candidate >= 0 {
+				pubkey, known := includedPubkeyByIndex[uint64(candidate)]
+				if known && pubkey != deposit.Pubkey {
+					candidate--
+					continue
+				}
+				break // matches, or unknown (beyond cache) -> accept and fall back to contiguous
+			}
+			if candidate < 0 {
+				break
+			}
+			if tailRegularIdx < 0 {
+				tailRegularIdx = idx
+			}
+			depositIndexCopy := uint64(candidate)
+			indexes[idx] = &depositIndexCopy
+			candidate--
+		}
+	}
+
+	// Anchor verification. The tail-most regular entry must align with the anchor's slot.
+	// If it doesn't (a degenerate queue whose most recent deposits are all postponed or
+	// builder deposits, so the anchor is not the real tail), the positional assignment
+	// cannot be trusted and every non-synthetic entry is resolved by slot instead. This
+	// recovers the "queue is nothing but postponed deposits" case, which has no slot dip.
+	anchorVerified := tailRegularIdx >= 0 && anchor != nil &&
+		queue[tailRegularIdx].Slot == phase0.Slot(anchor.SlotNumber)
+	if !anchorVerified {
+		for idx, deposit := range queue {
+			if isSyntheticPendingDeposit(deposit) {
+				continue
+			}
+			postponed[idx] = true
+			indexes[idx] = nil
+		}
+	}
+
+	return indexes, postponed
+}
+
+// resolvePostponedDepositIndexes fills in the EL deposit index of queue entries flagged
+// as postponed. These were reordered out of the queue's slot<->index sequence, so they
+// can't be aligned by position; instead they are looked up in a single batched query by
+// their slot (which equals the beacon state's PendingDeposit.slot) and matched on
+// (slot, pubkey, amount, withdrawal_credentials). Byte-identical deposits sharing a slot
+// are consumed in slot_index order, matching their queue order. Entries with no DB match
+// are left without an index rather than wrongly assigned.
+func (bs *ChainService) resolvePostponedDepositIndexes(ctx context.Context, queue []*electra.PendingDeposit, entries []*IndexedDepositQueueEntry, postponed []bool) {
+	slotSet := make(map[uint64]struct{})
+	for idx, isPostponed := range postponed {
+		if isPostponed {
+			slotSet[uint64(queue[idx].Slot)] = struct{}{}
+		}
+	}
+	if len(slotSet) == 0 {
+		return
+	}
+
+	slots := make([]uint64, 0, len(slotSet))
+	for slot := range slotSet {
+		slots = append(slots, slot)
+	}
+
+	rows, err := db.GetDepositRequestsBySlots(ctx, slots, bs.GetCanonicalForkIds())
+	if err != nil {
+		logrus.Warnf("ChainService.resolvePostponedDepositIndexes error: %v", err)
+		return
+	}
+
+	depositKey := func(slot, amount uint64, pubkey, wdcreds []byte) string {
+		return fmt.Sprintf("%d-%x-%d-%x", slot, pubkey, amount, wdcreds)
+	}
+
+	// Rows arrive ordered by (slot_number, slot_index), so identical deposits keep their
+	// inclusion order within each key.
+	indexesByKey := make(map[string][]uint64, len(rows))
+	for _, row := range rows {
+		if row.Index == nil {
+			continue
+		}
+		key := depositKey(row.SlotNumber, row.Amount, row.PublicKey, row.WithdrawalCredentials)
+		indexesByKey[key] = append(indexesByKey[key], *row.Index)
+	}
+
+	for idx, isPostponed := range postponed {
+		if !isPostponed {
+			continue
+		}
+		deposit := queue[idx]
+		key := depositKey(uint64(deposit.Slot), uint64(deposit.Amount), deposit.Pubkey[:], deposit.WithdrawalCredentials)
+		indexes := indexesByKey[key]
+		if len(indexes) == 0 {
+			continue
+		}
+		depositIndexCopy := indexes[0]
+		indexesByKey[key] = indexes[1:]
+		entries[idx].DepositIndex = &depositIndexCopy
+	}
+}
+
+// isSyntheticPendingDeposit reports whether a pending deposit was synthesized during
+// state transition (queue_excess_active_balance, e.g. a 0x01->0x02 compounding switch)
+// rather than created from an EL deposit. Such deposits carry the G2 point-at-infinity
+// signature (0xc0 followed by zeros) and have no corresponding EL deposit index.
+func isSyntheticPendingDeposit(deposit *electra.PendingDeposit) bool {
+	if deposit.Signature[0] != 0xc0 {
+		return false
+	}
+	for _, b := range deposit.Signature[1:] {
+		if b != 0 {
+			return false
+		}
+	}
+	return true
+}
+
+// getRecentIncludedDeposits returns the most recent queue-eligible included deposit —
+// the anchor used to align EL deposit indexes to the pending_deposits queue — together
+// with a map of EL deposit index -> pubkey for the recent included deposits.
+//
+// The map intentionally includes ALL included deposits, even post-Gloas builder (0x03)
+// deposits that are onboarded as builders and never enter the queue, so callers can
+// detect the index gaps those deposits leave and match queue entries across them by
+// pubkey. The anchor, by contrast, is the last deposit that actually enters the queue
+// (builder deposits are excluded only once Gloas is active).
+func (bs *ChainService) getRecentIncludedDeposits(ctx context.Context, headRoot phase0.Root) (*dbtypes.Deposit, map[uint64]phase0.BLSPubKey) {
+	indexPubkeys := make(map[uint64]phase0.BLSPubKey)
+
 	headBlock := bs.beaconIndexer.GetBlockByRoot(headRoot)
 	if headBlock == nil {
-		return nil
+		return nil, indexPubkeys
 	}
 
 	canonicalForkIds := bs.beaconIndexer.GetParentForkIds(headBlock.GetForkId())
@@ -553,73 +773,75 @@ func (bs *ChainService) getLastIncludedDeposit(headRoot phase0.Root) *dbtypes.De
 	idxMinSlot := chainState.EpochToSlot(prunedEpoch)
 
 	// load most recent objects from indexer cache
-	var lastDeposits []*dbtypes.Deposit
+	var lastQueued *dbtypes.Deposit
 	depositIndexCache := make(map[phase0.Root]uint64)
 	for slotIdx := idxMinSlot; slotIdx <= headBlock.Slot; slotIdx++ {
-		slot := uint64(slotIdx)
-		blocks := bs.beaconIndexer.GetBlocksBySlot(phase0.Slot(slot))
-		if blocks != nil {
-			for bidx := 0; bidx < len(blocks); bidx++ {
-				block := blocks[bidx]
-				isCanonical := slices.Contains(canonicalForkIds, block.GetForkId())
-				if !isCanonical {
-					continue
-				}
+		blocks := bs.beaconIndexer.GetBlocksBySlot(phase0.Slot(uint64(slotIdx)))
+		for bidx := 0; bidx < len(blocks); bidx++ {
+			block := blocks[bidx]
+			isCanonical := slices.Contains(canonicalForkIds, block.GetForkId())
+			if !isCanonical {
+				continue
+			}
 
-				// get deposit index
-				var firstDepositIndex uint64
-				var hasFirstDepositIndex bool
-
-				parentRoot := block.GetParentRoot()
-				if parentRoot != nil {
-					firstDepositIndex, hasFirstDepositIndex = depositIndexCache[*parentRoot]
-					if !hasFirstDepositIndex {
-						epochStats := bs.beaconIndexer.GetEpochStatsByBlockRoot(chainState.EpochOfSlot(block.Slot), *parentRoot)
-						if epochStats != nil {
-							epochStatsParentRoot := epochStats.GetDependentRoot()
-							if bytes.Equal(epochStatsParentRoot[:], parentRoot[:]) {
-								values := epochStats.GetValues(false)
-								if values != nil {
-									hasFirstDepositIndex = true
-									firstDepositIndex = values.FirstDepositIndex
-								}
+			// resolve the first deposit index of this block from its parent epoch stats
+			var firstDepositIndex uint64
+			var hasFirstDepositIndex bool
+			parentRoot := block.GetParentRoot()
+			if parentRoot != nil {
+				firstDepositIndex, hasFirstDepositIndex = depositIndexCache[*parentRoot]
+				if !hasFirstDepositIndex {
+					epochStats := bs.beaconIndexer.GetEpochStatsByBlockRoot(chainState.EpochOfSlot(block.Slot), *parentRoot)
+					if epochStats != nil {
+						epochStatsParentRoot := epochStats.GetDependentRoot()
+						if bytes.Equal(epochStatsParentRoot[:], parentRoot[:]) {
+							if values := epochStats.GetValues(false); values != nil {
+								hasFirstDepositIndex = true
+								firstDepositIndex = values.FirstDepositIndex
 							}
 						}
 					}
 				}
+			}
 
-				var deposits []*dbtypes.Deposit
-				if hasFirstDepositIndex {
-					depositIndex := firstDepositIndex
-					deposits = block.GetDbDeposits(bs.beaconIndexer, &depositIndex, isCanonical)
-					depositIndexCache[block.Root] = depositIndex
-				} else {
-					deposits = block.GetDbDeposits(bs.beaconIndexer, nil, isCanonical)
-				}
+			var deposits []*dbtypes.Deposit
+			if hasFirstDepositIndex {
+				depositIndex := firstDepositIndex
+				deposits = block.GetDbDeposits(bs.beaconIndexer, &depositIndex, isCanonical)
+				depositIndexCache[block.Root] = depositIndex
+			} else {
+				deposits = block.GetDbDeposits(bs.beaconIndexer, nil, isCanonical)
+			}
 
-				if len(deposits) > 0 {
-					lastDeposits = deposits
+			// Builder deposits (0x03) enter the queue before Gloas (they become
+			// validators) but are onboarded as builders once Gloas is active and then
+			// skip the queue, leaving gaps in the index sequence.
+			skipBuilderDeposits := chainState.IsEip7732Enabled(chainState.EpochOfSlot(block.Slot))
+			for _, deposit := range deposits {
+				if deposit.Index != nil {
+					indexPubkeys[*deposit.Index] = phase0.BLSPubKey(deposit.PublicKey)
 				}
+				if skipBuilderDeposits && len(deposit.WithdrawalCredentials) > 0 && deposit.WithdrawalCredentials[0] == 0x03 {
+					continue // onboarded as a builder; not in the queue, not a valid anchor
+				}
+				lastQueued = deposit
 			}
 		}
 	}
 
-	if len(lastDeposits) > 0 {
-		lastDeposit := lastDeposits[len(lastDeposits)-1]
-		return lastDeposit
-	} else {
-		// get last deposit from db
-		dbDeposits, _, err := db.GetDepositsFiltered(0, 1, canonicalForkIdsUint64, &dbtypes.DepositFilter{
+	if lastQueued == nil {
+		// no included deposit in cache, fall back to the last canonical one in the db
+		dbDeposits, _, err := db.GetDepositsFiltered(ctx, 0, 1, canonicalForkIdsUint64, &dbtypes.DepositFilter{
 			WithOrphaned: 0,
 		}, nil)
 		if err != nil {
-			logrus.Warnf("ChainService.getLastIncludedDeposit error: %v", err)
+			logrus.Warnf("ChainService.getRecentIncludedDeposits error: %v", err)
 		} else if len(dbDeposits) > 0 {
-			return &dbDeposits[0].Deposit
+			lastQueued = &dbDeposits[0].Deposit
 		}
 	}
 
-	return nil
+	return lastQueued, indexPubkeys
 }
 
 type QueuedDepositFilter struct {
@@ -633,13 +855,13 @@ type QueuedDepositFilter struct {
 	MaxAmount         uint64
 }
 
-func (bs *ChainService) GetFilteredQueuedDeposits(filter *QueuedDepositFilter) []*IndexedDepositQueueEntry {
+func (bs *ChainService) GetFilteredQueuedDeposits(ctx context.Context, filter *QueuedDepositFilter) []*IndexedDepositQueueEntry {
 	canonicalHead := bs.beaconIndexer.GetCanonicalHead(nil)
 	if canonicalHead == nil {
 		return nil
 	}
 
-	queue := bs.GetIndexedDepositQueue(canonicalHead)
+	queue := bs.GetIndexedDepositQueue(ctx, canonicalHead)
 	if queue == nil {
 		return nil
 	}
