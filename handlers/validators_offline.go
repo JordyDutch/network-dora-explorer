@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -8,13 +9,14 @@ import (
 	"strings"
 	"time"
 
-	v1 "github.com/attestantio/go-eth2-client/api/v1"
-	"github.com/attestantio/go-eth2-client/spec/phase0"
 	"github.com/ethpandaops/dora/dbtypes"
 	"github.com/ethpandaops/dora/indexer/beacon"
 	"github.com/ethpandaops/dora/services"
 	"github.com/ethpandaops/dora/templates"
 	"github.com/ethpandaops/dora/types/models"
+	"github.com/ethpandaops/dora/utils"
+	v1 "github.com/ethpandaops/go-eth2-client/api/v1"
+	"github.com/ethpandaops/go-eth2-client/spec/phase0"
 	"github.com/sirupsen/logrus"
 )
 
@@ -57,6 +59,9 @@ func ValidatorsOffline(w http.ResponseWriter, r *http.Request) {
 			groupBy = 1
 		}
 	}
+	if groupBy < 1 || groupBy > 4 {
+		groupBy = 1
+	}
 
 	var groupKey string
 	if urlArgs.Has("key") {
@@ -83,7 +88,7 @@ func getValidatorsOfflinePageData(pageIdx uint64, pageSize uint64, sortOrder str
 	pageCacheKey := fmt.Sprintf("validators_offline:%v:%v:%v:%v:%v", pageIdx, pageSize, sortOrder, groupBy, groupKey)
 	pageRes, pageErr := services.GlobalFrontendCache.ProcessCachedPage(pageCacheKey, true, pageData, func(processingPage *services.FrontendCacheProcessingPage) interface{} {
 		processingPage.CacheTimeout = 10 * time.Second
-		return buildValidatorsOfflinePageData(pageIdx, pageSize, sortOrder, groupBy, groupKey)
+		return buildValidatorsOfflinePageData(processingPage.CallCtx, pageIdx, pageSize, sortOrder, groupBy, groupKey)
 	})
 	if pageErr == nil && pageRes != nil {
 		resData, resOk := pageRes.(*models.ValidatorsOfflinePageData)
@@ -95,7 +100,7 @@ func getValidatorsOfflinePageData(pageIdx uint64, pageSize uint64, sortOrder str
 	return pageData, pageErr
 }
 
-func buildValidatorsOfflinePageData(pageIdx uint64, pageSize uint64, sortOrder string, groupBy uint64, groupKey string) *models.ValidatorsOfflinePageData {
+func buildValidatorsOfflinePageData(ctx context.Context, pageIdx uint64, pageSize uint64, sortOrder string, groupBy uint64, groupKey string) *models.ValidatorsOfflinePageData {
 	chainState := services.GlobalBeaconService.GetChainState()
 
 	filterArgs := url.Values{}
@@ -132,8 +137,26 @@ func buildValidatorsOfflinePageData(pageIdx uint64, pageSize uint64, sortOrder s
 		groupName = fmt.Sprintf("%v - %v", groupIdx*10000, (groupIdx+1)*10000)
 	case 3:
 		groupName = groupKey
+	case 4:
+		if groupKey == "no-address" {
+			groupName = "no address"
+		} else {
+			withdrawalAddress, withdrawalCreds, err := utils.ParseWithdrawalAddressOrCredentials(groupKey)
+			if err == nil {
+				if len(withdrawalAddress) > 0 {
+					groupKey = fmt.Sprintf("%x", withdrawalAddress)
+					groupName = fmt.Sprintf("0x%x", withdrawalAddress)
+				} else {
+					groupKey = fmt.Sprintf("%x", withdrawalCreds)
+					groupName = fmt.Sprintf("0x%x", withdrawalCreds)
+				}
+			} else {
+				groupName = groupKey
+			}
+		}
 	}
 	pageData.GroupName = groupName
+	pageData.GroupKey = groupKey
 
 	// collect offline validators
 	offlineIndices := []phase0.ValidatorIndex{}
@@ -151,6 +174,10 @@ func buildValidatorsOfflinePageData(pageIdx uint64, pageSize uint64, sortOrder s
 			validatorGroupKey = fmt.Sprintf("%06d", groupIdx)
 		case 3:
 			validatorGroupKey = strings.ToLower(services.GlobalBeaconService.GetValidatorName(uint64(index)))
+		case 4:
+			if validator != nil {
+				validatorGroupKey, _ = utils.WithdrawalCredentialsGroup(validator.WithdrawalCredentials)
+			}
 		}
 
 		if validatorGroupKey != groupKey {
@@ -210,7 +237,7 @@ func buildValidatorsOfflinePageData(pageIdx uint64, pageSize uint64, sortOrder s
 
 	// get validator set
 	var validatorSet []v1.Validator
-	validatorSetRsp, validatorSetLen := services.GlobalBeaconService.GetFilteredValidatorSet(&validatorFilter, true)
+	validatorSetRsp, validatorSetLen := services.GlobalBeaconService.GetFilteredValidatorSet(ctx, &validatorFilter, true)
 	if len(validatorSetRsp) == 0 {
 		validatorSet = []v1.Validator{}
 	} else {
